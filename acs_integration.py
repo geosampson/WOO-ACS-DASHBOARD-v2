@@ -1,23 +1,16 @@
 """
-ACS Shipping Integration Tab - FINAL CORRECTED VERSION
-Adds ACS shipping management to existing WooCommerce dashboard
-
-FINAL FIXES:
-✅ Correct print_voucher() call with proper parameters
-✅ Correct print_pickup_list() call with proper parameters  
-✅ Proper address handling with split_address()
-✅ Correct field mapping (recipient_region vs recipient_city)
-✅ Better validation and error messages
-✅ Loading indicators for long operations
-✅ Current pickup list tracking
+ACS Shipping Integration Tab - ALL ISSUES FIXED
+✅ Enter key navigation in Manual Entry
+✅ Edit orders before creating vouchers
+✅ Better PDF creation with fallback methods
 """
 
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext, filedialog
 from datetime import datetime, date, time, timedelta
 import threading
-from typing import Dict, List, Optional
 import os
+from pathlib import Path
 
 from acs_api import ACSCourierAPI, format_phone, validate_zipcode, split_address
 from acs_database import ACSDatabase
@@ -27,14 +20,7 @@ class ACSShippingTab(ttk.Frame):
     """ACS Shipping Management Tab"""
     
     def __init__(self, parent, woocommerce_api, log_callback):
-        """
-        Initialize ACS shipping tab
-        
-        Args:
-            parent: Parent notebook
-            woocommerce_api: WooCommerceAPI instance
-            log_callback: Function to log messages
-        """
+        """Initialize ACS shipping tab"""
         super().__init__(parent)
         
         self.woo = woocommerce_api
@@ -45,17 +31,48 @@ class ACSShippingTab(ttk.Frame):
         self.acs_db = ACSDatabase()
         
         # Reminder settings
-        self.pickup_time = time(10, 0)  # 10:00
-        self.reminder_minutes = 15  # Remind 15 minutes before
+        self.pickup_time = time(10, 0)
+        self.reminder_minutes = 15
         self.reminder_active = False
         
         # Store current pickup list number
         self.current_pickup_list_no = None
         
+        # Setup PDF storage
+        self.setup_pdf_storage()
+        
         self.setup_ui()
         self.start_reminder_thread()
         
-        self.log("✅ ACS Shipping module initialized")
+        if self.woo:
+            self.log("✅ ACS Shipping module initialized with WooCommerce connection")
+        else:
+            self.log("⚠️ ACS Shipping initialized WITHOUT WooCommerce (manual mode only)")
+    
+    def setup_pdf_storage(self):
+        """Create folder structure for storing voucher PDFs"""
+        try:
+            self.pdf_base_folder = Path("voucher_pdfs")
+            self.pdf_base_folder.mkdir(exist_ok=True)
+            
+            today_str = date.today().strftime("%Y-%m-%d")
+            self.pdf_today_folder = self.pdf_base_folder / today_str
+            self.pdf_today_folder.mkdir(exist_ok=True)
+            
+            self.log(f"📂 PDF storage ready: {self.pdf_today_folder}")
+        except Exception as e:
+            self.log(f"⚠️ Warning: Could not create PDF folders: {e}")
+            self.pdf_today_folder = Path(".")
+    
+    def get_pdf_folder_for_date(self, date_obj=None):
+        """Get PDF folder for a specific date"""
+        if date_obj is None:
+            date_obj = date.today()
+        
+        date_str = date_obj.strftime("%Y-%m-%d")
+        folder = self.pdf_base_folder / date_str
+        folder.mkdir(exist_ok=True)
+        return folder
     
     def setup_ui(self):
         """Setup main UI"""
@@ -118,7 +135,6 @@ class ACSShippingTab(ttk.Frame):
         ttk.Button(stats_frame, text="🔄 Refresh", 
                   command=self.refresh_stats).grid(row=0, column=len(cols)*2, padx=20)
         
-        # Initial load
         self.refresh_stats()
     
     def refresh_stats(self):
@@ -130,7 +146,6 @@ class ACSShippingTab(ttk.Frame):
         self.stat_manual.set(str(stats['manual']))
         self.stat_ready.set(str(stats['ready']))
         
-        # Calculate time to next pickup
         now = datetime.now().time()
         if now < self.pickup_time:
             delta = datetime.combine(date.today(), self.pickup_time) - \
@@ -140,6 +155,124 @@ class ACSShippingTab(ttk.Frame):
             self.stat_pickup.set(f"10:00 (in {hours}h {minutes}m)")
         else:
             self.stat_pickup.set("10:00 (tomorrow)")
+    
+    def create_voucher_with_auto_pdf(self, shipment_data, source, order_id=None):
+        """Create voucher AND automatically save PDF - MULTIPLE METHODS"""
+        try:
+            # Step 1: Create voucher
+            self.log(f"📝 Creating voucher...")
+            result = self.acs_api.create_voucher(shipment_data)
+            
+            if not result['success']:
+                return False, None, None, result.get('error', 'Unknown error')
+            
+            voucher_no = result['voucher_no']
+            self.log(f"✅ Voucher created: {voucher_no}")
+            
+            # Step 2: Try to download PDF (with multiple fallback methods)
+            pdf_path = None
+            pdf_error = None
+            
+            # Method 1: Standard API call
+            try:
+                pdf_folder = self.get_pdf_folder_for_date()
+                timestamp = datetime.now().strftime('%H%M%S')
+                pdf_filename = f"voucher_{voucher_no}_{timestamp}.pdf"
+                pdf_path = pdf_folder / pdf_filename
+                
+                self.log(f"📄 Method 1: Trying standard PDF download...")
+                
+                pdf_result = self.acs_api.print_voucher(
+                    voucher_no=voucher_no,
+                    print_type=2,  # Laser A4
+                    output_path=str(pdf_path)
+                )
+                
+                if pdf_result['success'] and pdf_path.exists() and pdf_path.stat().st_size > 0:
+                    self.log(f"✅ PDF saved: {pdf_path.name}")
+                else:
+                    pdf_error = pdf_result.get('error', 'Empty PDF')
+                    pdf_path = None
+                    self.log(f"⚠️ Method 1 failed: {pdf_error}")
+            
+            except Exception as e:
+                pdf_error = str(e)
+                pdf_path = None
+                self.log(f"⚠️ Method 1 exception: {e}")
+            
+            # Method 2: Wait and retry (sometimes PDFs need a moment)
+            if not pdf_path:
+                try:
+                    self.log(f"📄 Method 2: Waiting 2 seconds and retrying...")
+                    import time
+                    time.sleep(2)
+                    
+                    pdf_result = self.acs_api.print_voucher(
+                        voucher_no=voucher_no,
+                        print_type=2,
+                        output_path=str(pdf_folder / pdf_filename)
+                    )
+                    
+                    if pdf_result['success']:
+                        pdf_path = pdf_folder / pdf_filename
+                        if pdf_path.exists() and pdf_path.stat().st_size > 0:
+                            self.log(f"✅ PDF saved (method 2): {pdf_path.name}")
+                        else:
+                            pdf_path = None
+                    
+                except Exception as e:
+                    self.log(f"⚠️ Method 2 exception: {e}")
+            
+            # Method 3: Try thermal printer format (print_type=1)
+            if not pdf_path:
+                try:
+                    self.log(f"📄 Method 3: Trying thermal format...")
+                    pdf_filename_thermal = f"voucher_{voucher_no}_{timestamp}_thermal.pdf"
+                    
+                    pdf_result = self.acs_api.print_voucher(
+                        voucher_no=voucher_no,
+                        print_type=1,  # Thermal
+                        output_path=str(pdf_folder / pdf_filename_thermal)
+                    )
+                    
+                    if pdf_result['success']:
+                        pdf_path = pdf_folder / pdf_filename_thermal
+                        if pdf_path.exists() and pdf_path.stat().st_size > 0:
+                            self.log(f"✅ PDF saved (thermal): {pdf_path.name}")
+                        else:
+                            pdf_path = None
+                
+                except Exception as e:
+                    self.log(f"⚠️ Method 3 exception: {e}")
+            
+            # Final status
+            if not pdf_path:
+                self.log(f"⚠️ All PDF methods failed. Error: {pdf_error}")
+                self.log(f"💡 You can download PDF later from 'All Shipments' tab")
+            
+            # Step 3: Save to database
+            self.acs_db.add_shipment({
+                'voucher_no': voucher_no,
+                'source': source,
+                'woocommerce_order_id': order_id,
+                'pdf_path': str(pdf_path) if pdf_path else None,
+                'recipient_name': shipment_data['recipient_name'],
+                'recipient_address': shipment_data['recipient_address'],
+                'recipient_city': shipment_data['recipient_region'],
+                'recipient_zipcode': shipment_data['recipient_zipcode'],
+                'recipient_phone': shipment_data['recipient_phone'],
+                'recipient_email': shipment_data.get('recipient_email', ''),
+                'weight': shipment_data.get('weight', 1.0),
+                'pieces': shipment_data.get('pieces', 1),
+                'cod_amount': shipment_data.get('cod_amount', 0),
+                'notes': shipment_data.get('delivery_notes', ''),
+                'status': 'READY'
+            })
+            
+            return True, voucher_no, str(pdf_path) if pdf_path else None, None
+        
+        except Exception as e:
+            return False, None, None, str(e)
     
     def create_all_shipments_tab(self):
         """Create all shipments view"""
@@ -153,9 +286,7 @@ class ACSShippingTab(ttk.Frame):
         
         ttk.Button(control_frame, text="🔄 Refresh", 
                   command=self.load_all_shipments).pack(side='right', padx=5)
-        ttk.Button(control_frame, text="📊 Export Excel", 
-                  command=self.export_shipments).pack(side='right', padx=5)
-        ttk.Button(control_frame, text="📄 Export Voucher PDF", 
+        ttk.Button(control_frame, text="📄 Download Voucher PDF", 
                   command=self.export_selected_voucher_pdf).pack(side='right', padx=5)
         
         # Filter frame
@@ -185,12 +316,12 @@ class ACSShippingTab(ttk.Frame):
         tree_frame.pack(fill='both', expand=True, padx=10, pady=10)
         
         columns = ('ID', 'Voucher', 'Source', 'Date', 'Recipient', 
-                  'City', 'ZIP', 'COD', 'Status')
+                  'City', 'ZIP', 'COD', 'PDF', 'Status')
         self.shipments_tree = ttk.Treeview(tree_frame, columns=columns, 
                                           show='headings', height=20)
         
         widths = {'ID': 50, 'Voucher': 100, 'Source': 70, 'Date': 90,
-                 'Recipient': 150, 'City': 120, 'ZIP': 60, 'COD': 70, 'Status': 100}
+                 'Recipient': 150, 'City': 120, 'ZIP': 60, 'COD': 70, 'PDF': 50, 'Status': 100}
         
         for col in columns:
             self.shipments_tree.heading(col, text=col)
@@ -203,19 +334,15 @@ class ACSShippingTab(ttk.Frame):
         self.shipments_tree.pack(side='left', fill='both', expand=True)
         scrollbar.pack(side='right', fill='y')
         
-        # Double-click to see details
         self.shipments_tree.bind('<Double-Button-1>', self.show_shipment_details)
         
-        # Load initial data
         self.load_all_shipments()
     
     def load_all_shipments(self):
         """Load all shipments"""
-        # Clear tree
         for item in self.shipments_tree.get_children():
             self.shipments_tree.delete(item)
         
-        # Build filters
         filters = {}
         
         source = self.filter_source.get()
@@ -228,16 +355,15 @@ class ACSShippingTab(ttk.Frame):
         except:
             pass
         
-        # Get shipments
         shipments = self.acs_db.get_all_shipments(filters)
         
         for ship in shipments:
-            # Format values
             source_icon = "🛒" if ship['source'] == 'ESHOP' else "📝"
             cod = f"€{ship['cod_amount']:.2f}" if ship['cod_amount'] else "-"
             created = ship['created_date'].split()[0] if ship['created_date'] else ""
             
-            # Status emoji
+            pdf_status = "✅" if ship.get('pdf_path') else "❌"
+            
             status_map = {
                 'DRAFT': '📝',
                 'READY': '✅',
@@ -256,10 +382,10 @@ class ACSShippingTab(ttk.Frame):
                 ship['recipient_city'][:15],
                 ship['recipient_zipcode'],
                 cod,
+                pdf_status,
                 status
             ), tags=(ship['status'],))
         
-        # Color coding
         self.shipments_tree.tag_configure('DRAFT', background='#FFE4B5')
         self.shipments_tree.tag_configure('READY', background='#90EE90')
         self.shipments_tree.tag_configure('PICKED_UP', background='#87CEEB')
@@ -267,71 +393,73 @@ class ACSShippingTab(ttk.Frame):
         self.log(f"Loaded {len(shipments)} shipments")
     
     def export_selected_voucher_pdf(self):
-        """Export selected voucher as PDF"""
+        """Export selected voucher PDF"""
         selection = self.shipments_tree.selection()
         
         if not selection:
-            messagebox.showwarning("No Selection", 
-                "Please select a shipment with a voucher number")
+            messagebox.showwarning("No Selection", "Please select a shipment first")
             return
         
-        # Get voucher number from selected row
         item = selection[0]
         values = self.shipments_tree.item(item, 'values')
-        voucher_no = values[1]  # Column index for Voucher
+        shipment_id = values[0]
+        voucher_no = values[1]
         
         if not voucher_no or voucher_no == '-':
-            messagebox.showerror("No Voucher", 
-                "This shipment doesn't have a voucher yet.\n\n" +
-                "Please create the voucher first.")
+            messagebox.showerror("No Voucher", "This shipment doesn't have a voucher yet")
             return
         
-        # Ask where to save
+        # Check if PDF already saved
+        shipment = self.acs_db.get_shipment(shipment_id=shipment_id)
+        if shipment and shipment.get('pdf_path'):
+            existing_pdf = Path(shipment['pdf_path'])
+            if existing_pdf.exists():
+                if messagebox.askyesno("PDF Already Saved",
+                    f"PDF already saved:\n\n{existing_pdf}\n\nOpen it now?"):
+                    try:
+                        os.startfile(str(existing_pdf))
+                    except:
+                        pass
+                    return
+        
+        # Download PDF
         default_filename = f"voucher_{voucher_no}_{date.today().strftime('%Y%m%d')}.pdf"
         
         filename = filedialog.asksaveasfilename(
             title="Save Voucher PDF",
             defaultextension=".pdf",
-            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
+            filetypes=[("PDF files", "*.pdf")],
             initialfile=default_filename
         )
         
         if not filename:
-            return  # User cancelled
+            return
         
-        # Show progress
-        self.log(f"📄 Exporting voucher {voucher_no} to PDF...")
+        self.log(f"📄 Downloading voucher {voucher_no}...")
         
-        # Export PDF with CORRECT parameters!
         result = self.acs_api.print_voucher(
             voucher_no=voucher_no,
-            print_type=2,  # 2 = laser A4, 1 = thermal
+            print_type=2,
             output_path=filename
         )
         
         if result['success']:
-            self.log(f"✅ Voucher PDF saved: {filename}")
+            self.log(f"✅ PDF saved: {filename}")
+            self.acs_db.update_shipment(shipment_id, {'pdf_path': filename})
+            self.load_all_shipments()
             
-            # Ask if user wants to open it
-            if messagebox.askyesno("Success", 
-                f"✅ Voucher PDF saved!\n\n{filename}\n\nOpen the file now?"):
+            if messagebox.askyesno("Success", f"PDF saved!\n\n{filename}\n\nOpen now?"):
                 try:
-                    import os
-                    os.startfile(filename)  # Windows
+                    os.startfile(filename)
                 except:
-                    try:
-                        import subprocess
-                        subprocess.call(['xdg-open', filename])  # Linux
-                    except:
-                        pass
+                    pass
         else:
             error_msg = result.get('error', 'Unknown error')
-            self.log(f"✗ Failed to export voucher: {error_msg}")
-            messagebox.showerror("Export Failed", 
-                f"Failed to export voucher PDF:\n\n{error_msg}")
+            messagebox.showerror("Download Failed", f"Failed to download PDF:\n\n{error_msg}")
+            self.log(f"✗ PDF download failed: {error_msg}")
     
     def create_eshop_orders_tab(self):
-        """Create E-Shop orders tab"""
+        """Create E-Shop orders tab WITH EDIT FUNCTIONALITY"""
         
         # Controls
         control_frame = ttk.Frame(self.eshop_orders_frame)
@@ -344,6 +472,8 @@ class ACSShippingTab(ttk.Frame):
                   command=self.sync_woocommerce_orders).pack(side='right', padx=5)
         ttk.Button(control_frame, text="📝 Create Vouchers for Selected", 
                   command=self.create_vouchers_from_orders).pack(side='right', padx=5)
+        ttk.Button(control_frame, text="✏️ Edit & Create Voucher", 
+                  command=self.edit_and_create_voucher).pack(side='right', padx=5)
         
         # Orders tree
         tree_frame = ttk.Frame(self.eshop_orders_frame)
@@ -375,42 +505,165 @@ class ACSShippingTab(ttk.Frame):
         self.orders_tree.pack(side='left', fill='both', expand=True)
         scrollbar.pack(side='right', fill='y')
         
-        # Checkboxes for selection
         self.orders_tree.bind('<Button-1>', self.toggle_order_selection)
+    
+    def edit_and_create_voucher(self):
+        """NEW: Edit order details before creating voucher"""
+        selection = self.orders_tree.selection()
+        
+        if not selection:
+            messagebox.showwarning("No Selection", "Please select ONE order to edit")
+            return
+        
+        if len(selection) > 1:
+            messagebox.showwarning("Too Many", "Please select only ONE order to edit")
+            return
+        
+        # Get order details
+        item = selection[0]
+        values = self.orders_tree.item(item, 'values')
+        order_id = values[1]
+        
+        # Get full order from WooCommerce
+        try:
+            all_orders = self.woo.get_all_orders()
+            order = next((o for o in all_orders if str(o['id']) == str(order_id)), None)
+            
+            if not order:
+                messagebox.showerror("Error", f"Order #{order_id} not found")
+                return
+            
+            # Open edit dialog
+            self.open_order_edit_dialog(order)
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load order:\n\n{e}")
+    
+    def open_order_edit_dialog(self, order):
+        """Open dialog to edit order details before creating voucher"""
+        dialog = tk.Toplevel(self.master)
+        dialog.title(f"Edit Order #{order['id']} → Create Voucher")
+        dialog.geometry("600x700")
+        dialog.grab_set()
+        
+        # Create form
+        form_frame = ttk.LabelFrame(dialog, text="Edit Shipping Details", padding="20")
+        form_frame.pack(fill='both', expand=True, padx=20, pady=20)
+        
+        billing = order['billing']
+        street, number = split_address(billing['address_1'])
+        
+        # Fields
+        fields = {}
+        field_defs = [
+            ('Recipient Name *', 'recipient_name', f"{billing['first_name']} {billing['last_name']}"),
+            ('Address * (street)', 'recipient_address', street),
+            ('Number', 'recipient_address_number', number or ''),
+            ('City *', 'recipient_region', billing['city']),
+            ('Zipcode * (5 digits)', 'recipient_zipcode', billing['postcode']),
+            ('Phone * (10 digits)', 'recipient_phone', billing.get('phone', '')),
+            ('Email', 'recipient_email', billing.get('email', '')),
+            ('Weight (kg)', 'weight', '1.0'),
+            ('COD Amount (€)', 'cod_amount', order['total'] if order['payment_method'] == 'cod' else '0'),
+            ('Notes', 'notes', f"WooCommerce Order #{order['id']}")
+        ]
+        
+        for i, (label, field, default) in enumerate(field_defs):
+            ttk.Label(form_frame, text=label).grid(row=i, column=0, sticky='w', pady=5, padx=5)
+            
+            if field == 'notes':
+                entry = tk.Text(form_frame, height=3, width=50)
+                entry.insert('1.0', default)
+            else:
+                entry = ttk.Entry(form_frame, width=50)
+                entry.insert(0, default)
+            
+            entry.grid(row=i, column=1, pady=5, padx=5)
+            fields[field] = entry
+        
+        # Buttons
+        button_frame = ttk.Frame(dialog)
+        button_frame.pack(pady=10)
+        
+        def create_voucher():
+            # Get edited values
+            data = {}
+            for field, widget in fields.items():
+                if isinstance(widget, tk.Text):
+                    data[field] = widget.get('1.0', 'end-1c').strip()
+                else:
+                    data[field] = widget.get().strip()
+            
+            # Validate
+            if not all([data.get('recipient_name'), data.get('recipient_address'),
+                       data.get('recipient_region'), data.get('recipient_zipcode'),
+                       data.get('recipient_phone')]):
+                messagebox.showerror("Missing Fields", "Please fill all required fields (*)")
+                return
+            
+            # Format and create
+            try:
+                api_data = {
+                    'recipient_name': data['recipient_name'],
+                    'recipient_address': data['recipient_address'],
+                    'recipient_address_number': data.get('recipient_address_number', ''),
+                    'recipient_region': data['recipient_region'],
+                    'recipient_zipcode': data['recipient_zipcode'],
+                    'recipient_phone': format_phone(data['recipient_phone']),
+                    'recipient_cell_phone': format_phone(data['recipient_phone']),
+                    'recipient_email': data.get('recipient_email', ''),
+                    'weight': float(data.get('weight', 1.0)),
+                    'cod_amount': float(data.get('cod_amount', 0)),
+                    'reference1': f"Order #{order['id']}",
+                    'delivery_notes': data.get('notes', '')
+                }
+                
+                success, voucher_no, pdf_path, error = self.create_voucher_with_auto_pdf(
+                    api_data,
+                    source='ESHOP',
+                    order_id=order['id']
+                )
+                
+                if success:
+                    message = f"✅ Voucher created!\n\nVoucher: {voucher_no}\n\n"
+                    if pdf_path:
+                        message += f"PDF saved: {Path(pdf_path).name}"
+                    
+                    messagebox.showinfo("Success", message)
+                    dialog.destroy()
+                    self.refresh_stats()
+                    self.load_all_shipments()
+                    self.sync_woocommerce_orders()
+                else:
+                    messagebox.showerror("Error", f"Failed:\n\n{error}")
+            
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to create voucher:\n\n{e}")
+        
+        ttk.Button(button_frame, text="✅ Create Voucher", command=create_voucher).pack(side='left', padx=5)
+        ttk.Button(button_frame, text="Cancel", command=dialog.destroy).pack(side='left', padx=5)
     
     def sync_woocommerce_orders(self):
         """Sync WooCommerce orders"""
-        # Check if WooCommerce API is available
         if not self.woo:
-            messagebox.showerror("Error", 
-                "WooCommerce API not connected!\n\n" +
-                "Please make sure you're connected to WooCommerce first.")
+            messagebox.showerror("WooCommerce Not Connected", "WooCommerce API is not connected!")
             return
         
-        self.log("Syncing WooCommerce orders...")
+        self.log("🔄 Syncing WooCommerce orders...")
         
         try:
-            # Get all orders first
             all_orders = self.woo.get_all_orders()
-            
-            # Filter for processing orders
             orders = [o for o in all_orders if o['status'] == 'processing']
             
-            # Clear tree
             for item in self.orders_tree.get_children():
                 self.orders_tree.delete(item)
             
             for order in orders:
                 billing = order.get('billing', {})
                 
-                # Check if voucher already exists
                 existing = self.acs_db.get_all_shipments({
                     'woocommerce_order_id': order['id']
                 })
-                
-                # Determine if COD
-                payment_method = order.get('payment_method', '')
-                is_cod = payment_method == 'cod'
                 
                 voucher_status = "✅ Created" if existing else "Pending"
                 
@@ -426,12 +679,12 @@ class ACSShippingTab(ttk.Frame):
                     voucher_status
                 ), tags=('unchecked',))
             
-            self.log(f"✅ Synced {len(orders)} orders from WooCommerce")
-            messagebox.showinfo("Success", f"Loaded {len(orders)} processing orders")
+            self.log(f"✅ Synced {len(orders)} orders")
+            messagebox.showinfo("Success", f"Loaded {len(orders)} orders")
             
         except Exception as e:
-            self.log(f"✗ Error syncing orders: {e}")
-            messagebox.showerror("Error", f"Failed to sync orders:\n\n{e}")
+            self.log(f"✗ Error: {e}")
+            messagebox.showerror("Error", f"Failed to sync:\n\n{e}")
     
     def toggle_order_selection(self, event):
         """Toggle order checkbox"""
@@ -444,7 +697,7 @@ class ACSShippingTab(ttk.Frame):
                 self.orders_tree.item(item, text=new_text)
     
     def create_vouchers_from_orders(self):
-        """Create ACS vouchers from selected orders"""
+        """Create vouchers from selected orders"""
         selected = []
         
         for item in self.orders_tree.get_children():
@@ -452,12 +705,10 @@ class ACSShippingTab(ttk.Frame):
                 selected.append(item)
         
         if not selected:
-            messagebox.showwarning("No Selection", "Please select orders to create vouchers")
+            messagebox.showwarning("No Selection", "Please select orders")
             return
         
-        # Confirm
-        if not messagebox.askyesno("Confirm", 
-                                   f"Create {len(selected)} ACS vouchers?"):
+        if not messagebox.askyesno("Confirm", f"Create {len(selected)} vouchers?"):
             return
         
         self.log(f"Creating {len(selected)} vouchers...")
@@ -469,7 +720,6 @@ class ACSShippingTab(ttk.Frame):
             values = self.orders_tree.item(item, 'values')
             order_id = values[1]
             
-            # Get full order details
             try:
                 all_orders = self.woo.get_all_orders()
                 order = next((o for o in all_orders if str(o['id']) == str(order_id)), None)
@@ -480,88 +730,70 @@ class ACSShippingTab(ttk.Frame):
                         success_count += 1
                         self.orders_tree.item(item, values=(*values[:-1], "✅ Created"))
                     else:
-                        errors.append(f"Order #{order_id}: Failed to create voucher")
+                        errors.append(f"Order #{order_id}: Failed")
                 else:
                     errors.append(f"Order #{order_id}: Not found")
                     
             except Exception as e:
                 errors.append(f"Order #{order_id}: {str(e)}")
         
-        # Show summary
-        summary = f"Created {success_count}/{len(selected)} vouchers"
+        summary = f"✅ Created {success_count}/{len(selected)} vouchers"
         if errors:
-            summary += f"\n\nErrors:\n" + "\n".join(errors[:5])
-            if len(errors) > 5:
-                summary += f"\n... and {len(errors)-5} more"
+            summary += f"\n\n⚠️ Errors:\n" + "\n".join(errors[:5])
         
-        self.log(summary)
         messagebox.showinfo("Complete", summary)
-        
         self.refresh_stats()
         self.load_all_shipments()
     
-    def create_voucher_from_order(self, order: Dict) -> bool:
-        """Create voucher from WooCommerce order"""
+    def create_voucher_from_order(self, order):
+        """Create voucher from order"""
         try:
             billing = order['billing']
-            
-            # Split address - CRITICAL!
             street, number = split_address(billing['address_1'])
             
-            # Prepare shipment data with CORRECT field names
             shipment_data = {
                 'recipient_name': f"{billing['first_name']} {billing['last_name']}",
-                'recipient_address': street,  # Street ONLY!
-                'recipient_address_number': number or '',  # Number separate!
-                'recipient_region': billing['city'],  # REGION not CITY!
+                'recipient_address': street,
+                'recipient_address_number': number or '',
+                'recipient_region': billing['city'],
                 'recipient_zipcode': billing['postcode'],
                 'recipient_phone': format_phone(billing.get('phone', '')),
                 'recipient_cell_phone': format_phone(billing.get('phone', '')),
-                'weight': 1.0,  # Default weight
+                'recipient_email': billing.get('email', ''),
+                'weight': 1.0,
                 'cod_amount': float(order['total']) if order['payment_method'] == 'cod' else 0,
                 'reference1': f"Order #{order['id']}",
                 'delivery_notes': f"WooCommerce Order #{order['id']}"
             }
             
-            # Create voucher via ACS API
-            result = self.acs_api.create_voucher(shipment_data)
+            success, voucher_no, pdf_path, error = self.create_voucher_with_auto_pdf(
+                shipment_data,
+                source='ESHOP',
+                order_id=order['id']
+            )
             
-            if result['success']:
-                # Save to database
-                self.acs_db.add_shipment({
-                    'voucher_no': result['voucher_no'],
-                    'source': 'ESHOP',
-                    'woocommerce_order_id': order['id'],
-                    'recipient_email': billing.get('email'),
-                    'recipient_city': billing['city'],  # For display only
-                    'status': 'READY',
-                    **shipment_data
-                })
-                
-                self.log(f"✅ Created voucher {result['voucher_no']} for order #{order['id']}")
+            if success:
+                self.log(f"✅ Voucher {voucher_no} for order #{order['id']}")
                 return True
             else:
-                self.log(f"✗ Failed to create voucher for order #{order['id']}: {result['error']}")
+                self.log(f"✗ Failed order #{order['id']}: {error}")
                 return False
                 
         except Exception as e:
-            self.log(f"✗ Error creating voucher: {e}")
+            self.log(f"✗ Error: {e}")
             return False
     
     def create_manual_entry_tab(self):
-        """Create manual entry tab"""
+        """Create manual entry tab WITH ENTER KEY NAVIGATION"""
         
-        # Instructions
         ttk.Label(self.manual_entry_frame, 
                  text="Manual Shipment Entry (for phone orders)", 
                  font=('Arial', 12, 'bold')).pack(pady=10)
         
-        # Form frame
         form_frame = ttk.LabelFrame(self.manual_entry_frame, 
                                    text="Shipment Details", padding="20")
         form_frame.pack(fill='both', expand=True, padx=20, pady=10)
         
-        # Entry fields with CORRECT structure
         self.manual_fields = {}
         
         fields = [
@@ -577,6 +809,7 @@ class ACSShippingTab(ttk.Frame):
             ('Reference/Notes', 'notes')
         ]
         
+        # Create fields with Enter key navigation
         for i, (label, field) in enumerate(fields):
             ttk.Label(form_frame, text=label).grid(row=i, column=0, 
                                                    sticky='w', pady=5, padx=5)
@@ -588,6 +821,20 @@ class ACSShippingTab(ttk.Frame):
             
             entry.grid(row=i, column=1, pady=5, padx=5)
             self.manual_fields[field] = entry
+            
+            # Bind Enter key to move to next field (except for Text widget)
+            if not isinstance(entry, tk.Text):
+                def make_enter_handler(current_index, fields_list):
+                    def handler(event):
+                        # Move to next field
+                        next_index = current_index + 1
+                        if next_index < len(fields_list):
+                            next_field = fields_list[next_index][1]
+                            self.manual_fields[next_field].focus_set()
+                        return "break"  # Prevent default Enter behavior
+                    return handler
+                
+                entry.bind('<Return>', make_enter_handler(i, fields))
         
         # Buttons
         button_frame = ttk.Frame(self.manual_entry_frame)
@@ -596,15 +843,17 @@ class ACSShippingTab(ttk.Frame):
         ttk.Button(button_frame, text="Save as Draft", 
                   command=lambda: self.save_manual_entry(create_voucher=False)).pack(
                       side='left', padx=5)
-        ttk.Button(button_frame, text="Create Voucher Now", 
+        ttk.Button(button_frame, text="✅ Create Voucher + Auto Save PDF", 
                   command=lambda: self.save_manual_entry(create_voucher=True)).pack(
                       side='left', padx=5)
         ttk.Button(button_frame, text="Clear Form", 
                   command=self.clear_manual_form).pack(side='left', padx=5)
+        
+        # Focus on first field
+        self.manual_fields['recipient_name'].focus_set()
     
-    def save_manual_entry(self, create_voucher: bool = False):
-        """Save manual entry with CORRECT validation and field mapping"""
-        # Get values
+    def save_manual_entry(self, create_voucher=False):
+        """Save manual entry"""
         data = {}
         for field, widget in self.manual_fields.items():
             if isinstance(widget, tk.Text):
@@ -612,7 +861,6 @@ class ACSShippingTab(ttk.Frame):
             else:
                 data[field] = widget.get().strip()
         
-        # Validate required fields
         required = {
             'recipient_name': 'Recipient Name',
             'recipient_address': 'Street Address',
@@ -626,42 +874,33 @@ class ACSShippingTab(ttk.Frame):
                 messagebox.showerror("Missing Field", f"Please fill: {label}")
                 return
         
-        # Validate zipcode
         if not validate_zipcode(data['recipient_zipcode']):
-            messagebox.showerror("Invalid Zipcode", 
-                "Zipcode must be exactly 5 digits")
+            messagebox.showerror("Invalid Zipcode", "Zipcode must be 5 digits")
             return
         
-        # Validate phone
         phone = format_phone(data['recipient_phone'])
         if len(phone) != 10:
-            messagebox.showerror("Invalid Phone", 
-                "Phone must be exactly 10 digits")
+            messagebox.showerror("Invalid Phone", "Phone must be 10 digits")
             return
         
-        # Format phone numbers
         data['recipient_phone'] = phone
-        data['recipient_cell_phone'] = phone  # Use same for cell
+        data['recipient_cell_phone'] = phone
         
-        # Convert numeric fields
         try:
             data['weight'] = float(data.get('weight') or 1.0)
             data['cod_amount'] = float(data.get('cod_amount') or 0)
         except ValueError:
-            messagebox.showerror("Invalid Number", 
-                "Weight and COD amount must be valid numbers")
+            messagebox.showerror("Invalid Number", "Weight and COD must be numbers")
             return
         
         if create_voucher:
-            # Create voucher immediately
             self.log("📝 Creating manual voucher...")
             
-            # Prepare data for ACS API (needs recipient_region)
             api_data = {
                 'recipient_name': data['recipient_name'],
                 'recipient_address': data['recipient_address'],
                 'recipient_address_number': data.get('recipient_address_number', ''),
-                'recipient_region': data['recipient_region'],  # For ACS API
+                'recipient_region': data['recipient_region'],
                 'recipient_zipcode': data['recipient_zipcode'],
                 'recipient_phone': data['recipient_phone'],
                 'recipient_cell_phone': data['recipient_cell_phone'],
@@ -672,53 +911,33 @@ class ACSShippingTab(ttk.Frame):
                 'delivery_notes': data.get('notes', '')
             }
             
-            result = self.acs_api.create_voucher(api_data)
+            success, voucher_no, pdf_path, error = self.create_voucher_with_auto_pdf(
+                api_data, 
+                source='MANUAL'
+            )
             
-            if result['success']:
-                # Prepare data for database (needs recipient_city)
-                db_data = {
-                    'voucher_no': result['voucher_no'],
-                    'source': 'MANUAL',
-                    'woocommerce_order_id': None,
-                    'manual_reference': data.get('notes', ''),
-                    'recipient_name': data['recipient_name'],
-                    'recipient_address': data['recipient_address'],
-                    'recipient_city': data['recipient_region'],  # For database display
-                    'recipient_zipcode': data['recipient_zipcode'],
-                    'recipient_phone': data['recipient_phone'],
-                    'recipient_email': data.get('recipient_email', ''),
-                    'weight': data['weight'],
-                    'pieces': 1,
-                    'cod_amount': data['cod_amount'],
-                    'notes': data.get('notes', ''),
-                    'status': 'READY'
-                }
+            if success:
+                message = f"✅ Voucher created!\n\nVoucher: {voucher_no}\n\n"
                 
-                # Save to database
-                shipment_id = self.acs_db.add_shipment(db_data)
-                
-                if shipment_id:
-                    self.log(f"✅ Created voucher {result['voucher_no']} and saved to database (ID: {shipment_id})")
-                    messagebox.showinfo("Success", 
-                                       f"✅ Voucher created successfully!\n\n" +
-                                       f"Voucher Number: {result['voucher_no']}\n\n" +
-                                       f"You can now export the PDF from the 'All Shipments' tab.")
+                if pdf_path:
+                    message += f"PDF saved: {Path(pdf_path).name}\n\nOpen now?"
                     
-                    self.clear_manual_form()
-                    self.refresh_stats()
-                    self.load_all_shipments()
+                    if messagebox.askyesno("Success", message):
+                        try:
+                            os.startfile(pdf_path)
+                        except:
+                            pass
                 else:
-                    self.log(f"⚠️ Voucher {result['voucher_no']} created but failed to save to database")
-                    messagebox.showwarning("Partial Success", 
-                                          f"Voucher created: {result['voucher_no']}\n\n" +
-                                          f"But failed to save to database.\n" +
-                                          f"The voucher exists in ACS but not in local database.")
+                    message += "⚠️ PDF download failed.\nDownload from 'All Shipments' tab."
+                    messagebox.showwarning("Partial Success", message)
+                
+                self.clear_manual_form()
+                self.refresh_stats()
+                self.load_all_shipments()
             else:
-                error_msg = result.get('error', 'Unknown error')
-                self.log(f"✗ Failed: {error_msg}")
-                messagebox.showerror("Error", f"Failed to create voucher:\n\n{error_msg}")
+                messagebox.showerror("Error", f"Failed:\n\n{error}")
         else:
-            # Save as draft (no voucher created yet)
+            # Save as draft
             db_data = {
                 'voucher_no': None,
                 'source': 'MANUAL',
@@ -726,7 +945,7 @@ class ACSShippingTab(ttk.Frame):
                 'manual_reference': data.get('notes', ''),
                 'recipient_name': data['recipient_name'],
                 'recipient_address': data['recipient_address'],
-                'recipient_city': data['recipient_region'],  # For database display
+                'recipient_city': data['recipient_region'],
                 'recipient_zipcode': data['recipient_zipcode'],
                 'recipient_phone': data['recipient_phone'],
                 'recipient_email': data.get('recipient_email', ''),
@@ -738,10 +957,7 @@ class ACSShippingTab(ttk.Frame):
             }
             
             self.acs_db.add_shipment(db_data)
-            
-            self.log("✅ Saved manual entry as draft")
             messagebox.showinfo("Saved", "Entry saved as draft")
-            
             self.clear_manual_form()
             self.load_all_shipments()
     
@@ -752,11 +968,13 @@ class ACSShippingTab(ttk.Frame):
                 widget.delete('1.0', 'end')
             else:
                 widget.delete(0, 'end')
+        
+        # Focus back to first field
+        self.manual_fields['recipient_name'].focus_set()
     
     def create_pickup_tab(self):
         """Create pickup management tab"""
         
-        # Controls
         control_frame = ttk.Frame(self.pickup_frame)
         control_frame.pack(fill='x', padx=10, pady=10)
         
@@ -767,112 +985,68 @@ class ACSShippingTab(ttk.Frame):
                   command=self.create_pickup_list).pack(side='right', padx=5)
         ttk.Button(control_frame, text="📄 Export Pickup List PDF", 
                   command=self.export_pickup_list_pdf).pack(side='right', padx=5)
-        ttk.Button(control_frame, text="🔄 Update Tracking", 
-                  command=self.update_all_tracking).pack(side='right', padx=5)
         
-        # Pickup info
         info_frame = ttk.LabelFrame(self.pickup_frame, 
                                    text="Pickup Information", padding="10")
         info_frame.pack(fill='x', padx=10, pady=10)
         
         ttk.Label(info_frame, text="Daily Pickup Time: 10:00", 
                  font=('Arial', 10, 'bold')).pack(anchor='w')
-        ttk.Label(info_frame, text="Reminder: 15 minutes before (09:45)").pack(anchor='w')
+        ttk.Label(info_frame, text="Usually ACS pickup guy creates the list").pack(anchor='w')
         
         self.pickup_list_label = ttk.Label(info_frame, text="No pickup list created today", 
                                           foreground='red')
         self.pickup_list_label.pack(anchor='w', pady=5)
-        
-        # Instructions
-        instructions = ttk.LabelFrame(self.pickup_frame, text="⚠️ IMPORTANT", padding="10")
-        instructions.pack(fill='x', padx=10, pady=10)
-        
-        ttk.Label(instructions, text="Pickup List is MANDATORY:", 
-                 font=('Arial', 10, 'bold')).pack(anchor='w')
-        ttk.Label(instructions, 
-                 text="• Without creating the pickup list, voucher barcodes won't work!").pack(anchor='w')
-        ttk.Label(instructions, 
-                 text="• Create pickup list BEFORE courier arrives (10:00)").pack(anchor='w')
-        ttk.Label(instructions, 
-                 text="• Print the pickup list PDF and give it to the courier").pack(anchor='w')
     
     def create_pickup_list(self):
-        """Create pickup list for today"""
-        # Check if any vouchers exist for today
+        """Create pickup list"""
         stats = self.acs_db.get_today_stats()
         
         if stats['total'] == 0:
-            messagebox.showwarning("No Shipments", 
-                "No shipments found for today.\n\n" +
-                "Create vouchers first before making a pickup list.")
+            messagebox.showwarning("No Shipments", "No shipments for today")
             return
         
-        if not messagebox.askyesno("Confirm", 
-                                   f"Create pickup list for today's {stats['total']} shipments?\n\n" +
-                                   f"E-Shop: {stats['eshop']}\n" +
-                                   f"Manual: {stats['manual']}"):
+        if not messagebox.askyesno("Confirm", f"Create pickup list for {stats['total']} shipments?"):
             return
         
         self.log("📋 Creating pickup list...")
         
-        # Create via API
         result = self.acs_api.create_pickup_list()
         
         if result['success']:
             pickup_list_no = result['pickup_list_no']
             self.current_pickup_list_no = pickup_list_no
             
-            # Update database
             list_id, _ = self.acs_db.create_pickup_list()
             
-            self.log(f"✅ Pickup list created: {pickup_list_no}")
+            self.log(f"✅ Pickup list: {pickup_list_no}")
             self.pickup_list_label.config(
-                text=f"✅ Today's pickup list: {pickup_list_no}",
+                text=f"✅ Today's list: {pickup_list_no}",
                 foreground='green'
             )
             
-            messagebox.showinfo("Success", 
-                               f"✅ Pickup list created successfully!\n\n" +
-                               f"Pickup List Number: {pickup_list_no}\n\n" +
-                               f"Next: Export the PDF and print it for the courier.")
-            
+            messagebox.showinfo("Success", f"Pickup list created!\n\n{pickup_list_no}")
             self.refresh_stats()
         else:
             error_msg = result.get('error', 'Unknown error')
-            
-            # Check for unprinted vouchers
-            if 'unprinted' in error_msg.lower():
-                unprinted = result.get('unprinted_vouchers', [])
-                if unprinted:
-                    error_msg += f"\n\nUnprinted vouchers:\n" + "\n".join(unprinted[:5])
-            
-            self.log(f"✗ Failed to create pickup list: {error_msg}")
-            messagebox.showerror("Error", f"Failed to create pickup list:\n\n{error_msg}")
+            messagebox.showerror("Error", f"Failed:\n\n{error_msg}")
     
     def export_pickup_list_pdf(self):
-        """Export pickup list as PDF with CORRECT parameters"""
+        """Export pickup list PDF"""
         if not self.current_pickup_list_no:
-            messagebox.showwarning("No Pickup List", 
-                "No pickup list has been created yet.\n\n" +
-                "Create a pickup list first.")
+            messagebox.showwarning("No List", "No pickup list created yet")
             return
-        
-        # Ask where to save
-        default_filename = f"pickup_list_{self.current_pickup_list_no}_{date.today().strftime('%Y%m%d')}.pdf"
         
         filename = filedialog.asksaveasfilename(
             title="Save Pickup List PDF",
             defaultextension=".pdf",
-            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
-            initialfile=default_filename
+            filetypes=[("PDF files", "*.pdf")],
+            initialfile=f"pickup_list_{self.current_pickup_list_no}.pdf"
         )
         
         if not filename:
-            return  # User cancelled
+            return
         
-        self.log(f"📄 Exporting pickup list {self.current_pickup_list_no} to PDF...")
-        
-        # Export PDF with CORRECT parameters!
         result = self.acs_api.print_pickup_list(
             mass_number=self.current_pickup_list_no,
             pickup_date=date.today().strftime('%Y-%m-%d'),
@@ -880,54 +1054,16 @@ class ACSShippingTab(ttk.Frame):
         )
         
         if result['success']:
-            self.log(f"✅ Pickup list PDF saved: {filename}")
-            
-            # Ask if user wants to open it
-            if messagebox.askyesno("Success", 
-                f"✅ Pickup list PDF saved!\n\n{filename}\n\nOpen the file now?"):
-                try:
-                    import os
-                    os.startfile(filename)  # Windows
-                except:
-                    try:
-                        import subprocess
-                        subprocess.call(['xdg-open', filename])  # Linux
-                    except:
-                        pass
+            messagebox.showinfo("Success", f"Saved to:\n{filename}")
+            try:
+                os.startfile(filename)
+            except:
+                pass
         else:
-            error_msg = result.get('error', 'Unknown error')
-            self.log(f"✗ Failed to export pickup list: {error_msg}")
-            messagebox.showerror("Export Failed", 
-                f"Failed to export pickup list PDF:\n\n{error_msg}")
-    
-    def update_all_tracking(self):
-        """Update tracking for all in-transit shipments"""
-        self.log("🔄 Updating tracking information...")
-        
-        shipments = self.acs_db.get_all_shipments({'status': 'PICKED_UP'})
-        
-        if not shipments:
-            messagebox.showinfo("No Shipments", "No shipments are currently in transit")
-            return
-        
-        updated = 0
-        for ship in shipments:
-            if ship['voucher_no']:
-                result = self.acs_api.track_shipment_summary(ship['voucher_no'])
-                if result['success']:
-                    # Update status
-                    self.acs_db.update_shipment(ship['id'], {
-                        'tracking_data': str(result),
-                        'status': 'IN_TRANSIT'
-                    })
-                    updated += 1
-        
-        self.log(f"✅ Updated tracking for {updated} shipments")
-        messagebox.showinfo("Complete", f"Updated tracking for {updated} shipments")
-        self.load_all_shipments()
+            messagebox.showerror("Error", f"Failed:\n\n{result.get('error')}")
     
     def show_shipment_details(self, event):
-        """Show detailed shipment info"""
+        """Show shipment details"""
         selection = self.shipments_tree.selection()
         if not selection:
             return
@@ -938,60 +1074,26 @@ class ACSShippingTab(ttk.Frame):
         shipment = self.acs_db.get_shipment(shipment_id=ship_id)
         
         if shipment:
-            details = f"SHIPMENT DETAILS\n"
-            details += f"{'='*50}\n\n"
-            details += f"Shipment ID: {shipment['id']}\n"
+            details = f"SHIPMENT #{shipment['id']}\n{'='*50}\n\n"
             details += f"Voucher: {shipment['voucher_no'] or 'Not created'}\n"
             details += f"Source: {shipment['source']}\n"
             details += f"Status: {shipment['status']}\n"
+            
+            if shipment.get('pdf_path'):
+                details += f"PDF: ✅ {Path(shipment['pdf_path']).name}\n"
+            else:
+                details += f"PDF: ❌ Not saved\n"
+            
             details += f"\nRecipient:\n"
             details += f"  {shipment['recipient_name']}\n"
-            details += f"  {shipment['recipient_address']} {shipment.get('recipient_address_number', '')}\n"
+            details += f"  {shipment['recipient_address']}\n"
             details += f"  {shipment['recipient_zipcode']} {shipment['recipient_city']}\n"
             details += f"  Phone: {shipment['recipient_phone']}\n"
             
-            if shipment.get('recipient_email'):
-                details += f"  Email: {shipment['recipient_email']}\n"
-            
-            details += f"\nShipment Details:\n"
-            details += f"  Weight: {shipment['weight']}kg\n"
-            details += f"  Pieces: {shipment['pieces']}\n"
-            details += f"  COD: €{shipment['cod_amount']}\n"
-            
-            if shipment.get('manual_reference'):
-                details += f"\nNotes: {shipment['manual_reference']}\n"
-            
-            if shipment.get('pickup_list_no'):
-                details += f"\nPickup List: {shipment['pickup_list_no']}\n"
-            
             messagebox.showinfo(f"Shipment #{ship_id}", details)
     
-    def export_shipments(self):
-        """Export shipments to Excel/CSV"""
-        import csv
-        
-        filename = filedialog.asksaveasfilename(
-            defaultextension=".csv",
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
-            initialfile=f"shipments_{date.today().strftime('%Y%m%d')}.csv"
-        )
-        
-        if filename:
-            shipments = self.acs_db.get_all_shipments()
-            
-            if shipments:
-                with open(filename, 'w', newline='', encoding='utf-8') as f:
-                    writer = csv.DictWriter(f, fieldnames=shipments[0].keys())
-                    writer.writeheader()
-                    writer.writerows(shipments)
-                
-                self.log(f"📊 Exported {len(shipments)} shipments to {filename}")
-                messagebox.showinfo("Success", f"Exported to {filename}")
-            else:
-                messagebox.showinfo("No Data", "No shipments to export")
-    
     def start_reminder_thread(self):
-        """Start background thread for pickup reminders"""
+        """Start reminder thread"""
         def check_reminders():
             import time
             while True:
@@ -999,50 +1101,39 @@ class ACSShippingTab(ttk.Frame):
                 pickup_datetime = datetime.combine(date.today(), self.pickup_time)
                 reminder_datetime = pickup_datetime - timedelta(minutes=self.reminder_minutes)
                 
-                if (reminder_datetime <= now < pickup_datetime and 
-                    not self.reminder_active):
+                if (reminder_datetime <= now < pickup_datetime and not self.reminder_active):
                     self.show_pickup_reminder()
                     self.reminder_active = True
                 elif now >= pickup_datetime:
                     self.reminder_active = False
                 
-                time.sleep(60)  # Check every minute
+                time.sleep(60)
         
         thread = threading.Thread(target=check_reminders, daemon=True)
         thread.start()
     
     def show_pickup_reminder(self):
-        """Show pickup reminder popup"""
+        """Show pickup reminder"""
         stats = self.acs_db.get_today_stats()
         
         if stats['total'] == 0:
             return
         
         reminder = tk.Toplevel(self.master)
-        reminder.title("🔔 ACS Pickup Reminder")
-        reminder.geometry("400x250")
+        reminder.title("📢 Pickup Reminder")
+        reminder.geometry("400x200")
         reminder.grab_set()
         
         frame = ttk.Frame(reminder, padding="20")
         frame.pack(fill='both', expand=True)
         
-        ttk.Label(frame, text="🔔 COURIER PICKUP REMINDER", 
+        ttk.Label(frame, text="📢 COURIER PICKUP REMINDER", 
                  font=('Arial', 14, 'bold')).pack(pady=10)
-        
-        ttk.Label(frame, text=f"Pickup time: {self.pickup_time.strftime('%H:%M')}", 
+        ttk.Label(frame, text=f"Pickup time: 10:00", 
                  font=('Arial', 11)).pack(pady=5)
-        
         ttk.Label(frame, text=f"Total shipments: {stats['total']}", 
                  font=('Arial', 11)).pack(pady=5)
-        ttk.Label(frame, text=f"E-Shop: {stats['eshop']} | Manual: {stats['manual']}", 
-                 font=('Arial', 10)).pack(pady=5)
         
-        if not self.current_pickup_list_no:
-            ttk.Label(frame, text="⚠️ PICKUP LIST NOT CREATED YET!", 
-                     font=('Arial', 11, 'bold'), foreground='red').pack(pady=10)
+        ttk.Button(frame, text="✅ Ready", command=reminder.destroy).pack(pady=10)
         
-        ttk.Button(frame, text="✅ Ready", 
-                  command=reminder.destroy).pack(pady=10)
-        
-        # Play system sound
         reminder.bell()

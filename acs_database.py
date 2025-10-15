@@ -1,6 +1,7 @@
 """
 SQLite Database for ACS Shipments
 Stores shipment history, tracking, and pickup lists
+WITH PDF PATH SUPPORT - Auto PDF save workflow
 """
 
 import sqlite3
@@ -19,6 +20,7 @@ class ACSDatabase:
         self.cursor = None
         self.connect()
         self.create_tables()
+        self.upgrade_database()  # Add any new columns if needed
     
     def connect(self):
         """Connect to SQLite database"""
@@ -34,7 +36,7 @@ class ACSDatabase:
     def create_tables(self):
         """Create database tables if they don't exist"""
         
-        # Shipments table
+        # Shipments table (WITH pdf_path column)
         self.cursor.execute("""
             CREATE TABLE IF NOT EXISTS shipments (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -61,6 +63,7 @@ class ACSDatabase:
                 status TEXT DEFAULT 'DRAFT',
                 tracking_data TEXT,
                 notes TEXT,
+                pdf_path TEXT,
                 
                 last_updated DATETIME DEFAULT CURRENT_TIMESTAMP
             )
@@ -98,48 +101,58 @@ class ACSDatabase:
         
         self.conn.commit()
     
-    # ==================== SHIPMENTS ====================
+    def upgrade_database(self):
+        """Add pdf_path column if it doesn't exist (for existing databases)"""
+        try:
+            # Check if pdf_path column exists
+            self.cursor.execute("PRAGMA table_info(shipments)")
+            columns = [col[1] for col in self.cursor.fetchall()]
+            
+            if 'pdf_path' not in columns:
+                print("📝 Upgrading database: Adding pdf_path column...")
+                self.cursor.execute("ALTER TABLE shipments ADD COLUMN pdf_path TEXT")
+                self.conn.commit()
+                print("✅ Database upgraded successfully!")
+        except Exception as e:
+            print(f"Note: Database upgrade check: {e}")
     
-    def add_shipment(self, shipment_data: Dict) -> int:
-        """
-        Add new shipment to database
-        
-        Returns:
-            Shipment ID
-        """
+    def add_shipment(self, data: Dict) -> int:
+        """Add new shipment to database"""
         try:
             self.cursor.execute("""
                 INSERT INTO shipments (
                     voucher_no, source, woocommerce_order_id, manual_reference,
                     recipient_name, recipient_address, recipient_city, 
                     recipient_zipcode, recipient_phone, recipient_email,
-                    weight, pieces, cod_amount, notes, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    weight, pieces, cod_amount, status, notes, pdf_path
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                shipment_data.get('voucher_no'),
-                shipment_data['source'],
-                shipment_data.get('woocommerce_order_id'),
-                shipment_data.get('manual_reference'),
-                shipment_data['recipient_name'],
-                shipment_data['recipient_address'],
-                shipment_data['recipient_city'],
-                shipment_data['recipient_zipcode'],
-                shipment_data['recipient_phone'],
-                shipment_data.get('recipient_email'),
-                shipment_data.get('weight', 1.0),
-                shipment_data.get('pieces', 1),
-                shipment_data.get('cod_amount', 0),
-                shipment_data.get('notes'),
-                shipment_data.get('status', 'DRAFT')
+                data.get('voucher_no'),
+                data['source'],
+                data.get('woocommerce_order_id'),
+                data.get('manual_reference'),
+                data['recipient_name'],
+                data['recipient_address'],
+                data['recipient_city'],
+                data['recipient_zipcode'],
+                data['recipient_phone'],
+                data.get('recipient_email', ''),
+                data.get('weight', 1.0),
+                data.get('pieces', 1),
+                data.get('cod_amount', 0),
+                data.get('status', 'DRAFT'),
+                data.get('notes', ''),
+                data.get('pdf_path')  # NEW: PDF path storage
             ))
             
             self.conn.commit()
             shipment_id = self.cursor.lastrowid
             
+            # Log activity
             self.log_activity(
-                'SHIPMENT_CREATED',
-                shipment_data.get('voucher_no'),
-                f"Source: {shipment_data['source']}"
+                'CREATE_SHIPMENT',
+                data.get('voucher_no'),
+                f"Created shipment for {data['recipient_name']}"
             )
             
             return shipment_id
@@ -148,33 +161,34 @@ class ACSDatabase:
             print(f"Error adding shipment: {e}")
             return None
     
-    def update_shipment(self, shipment_id: int, updates: Dict) -> bool:
-        """Update shipment fields"""
+    def update_shipment(self, shipment_id: int, data: Dict):
+        """Update existing shipment"""
         try:
-            # Build UPDATE query dynamically
+            # Build UPDATE query dynamically based on provided fields
             fields = []
             values = []
             
-            for key, value in updates.items():
-                fields.append(f"{key} = ?")
-                values.append(value)
+            for key, value in data.items():
+                if key != 'id':
+                    fields.append(f"{key} = ?")
+                    values.append(value)
             
-            # Always update last_updated
+            if not fields:
+                return
+            
+            # Add last_updated
             fields.append("last_updated = CURRENT_TIMESTAMP")
-            values.append(shipment_id)
             
             query = f"UPDATE shipments SET {', '.join(fields)} WHERE id = ?"
+            values.append(shipment_id)
             
             self.cursor.execute(query, values)
             self.conn.commit()
             
-            return True
-            
         except Exception as e:
             print(f"Error updating shipment: {e}")
-            return False
     
-    def get_shipment(self, shipment_id: int = None, voucher_no: str = None) -> Dict:
+    def get_shipment(self, shipment_id: int = None, voucher_no: str = None) -> Optional[Dict]:
         """Get shipment by ID or voucher number"""
         try:
             if shipment_id:
@@ -185,45 +199,42 @@ class ACSDatabase:
                 return None
             
             row = self.cursor.fetchone()
-            return dict(row) if row else None
+            if row:
+                return dict(row)
+            return None
             
         except Exception as e:
             print(f"Error getting shipment: {e}")
             return None
     
     def get_all_shipments(self, filters: Dict = None) -> List[Dict]:
-        """
-        Get all shipments with optional filters
-        
-        Filters:
-            - source: 'ESHOP' or 'MANUAL'
-            - status: shipment status
-            - date_from: from date
-            - date_to: to date
-            - has_voucher: True/False
-        """
+        """Get all shipments with optional filters"""
         try:
             query = "SELECT * FROM shipments WHERE 1=1"
             params = []
             
             if filters:
-                if filters.get('source'):
+                if 'source' in filters:
                     query += " AND source = ?"
                     params.append(filters['source'])
                 
-                if filters.get('status'):
+                if 'status' in filters:
                     query += " AND status = ?"
                     params.append(filters['status'])
                 
-                if filters.get('date_from'):
+                if 'woocommerce_order_id' in filters:
+                    query += " AND woocommerce_order_id = ?"
+                    params.append(filters['woocommerce_order_id'])
+                
+                if 'date_from' in filters:
                     query += " AND DATE(created_date) >= ?"
-                    params.append(filters['date_from'])
+                    params.append(filters['date_from'].strftime('%Y-%m-%d'))
                 
-                if filters.get('date_to'):
+                if 'date_to' in filters:
                     query += " AND DATE(created_date) <= ?"
-                    params.append(filters['date_to'])
+                    params.append(filters['date_to'].strftime('%Y-%m-%d'))
                 
-                if filters.get('has_voucher') is not None:
+                if 'has_voucher' in filters:
                     if filters['has_voucher']:
                         query += " AND voucher_no IS NOT NULL"
                     else:
@@ -240,211 +251,210 @@ class ACSDatabase:
             print(f"Error getting shipments: {e}")
             return []
     
-    def delete_shipment(self, shipment_id: int) -> bool:
-        """Delete shipment (only if no voucher created)"""
+    def get_today_stats(self) -> Dict:
+        """Get today's statistics"""
         try:
-            # Check if voucher exists
-            shipment = self.get_shipment(shipment_id=shipment_id)
-            if shipment and shipment.get('voucher_no'):
-                print("Cannot delete shipment with voucher. Cancel voucher first.")
-                return False
+            today = date.today().strftime('%Y-%m-%d')
             
-            self.cursor.execute("DELETE FROM shipments WHERE id = ?", (shipment_id,))
-            self.conn.commit()
+            # Total shipments today
+            self.cursor.execute("""
+                SELECT COUNT(*) FROM shipments 
+                WHERE DATE(created_date) = ?
+            """, (today,))
+            total = self.cursor.fetchone()[0]
             
-            self.log_activity('SHIPMENT_DELETED', None, f"Shipment ID: {shipment_id}")
+            # E-shop orders
+            self.cursor.execute("""
+                SELECT COUNT(*) FROM shipments 
+                WHERE DATE(created_date) = ? AND source = 'ESHOP'
+            """, (today,))
+            eshop = self.cursor.fetchone()[0]
             
-            return True
+            # Manual entries
+            self.cursor.execute("""
+                SELECT COUNT(*) FROM shipments 
+                WHERE DATE(created_date) = ? AND source = 'MANUAL'
+            """, (today,))
+            manual = self.cursor.fetchone()[0]
+            
+            # Ready for pickup
+            self.cursor.execute("""
+                SELECT COUNT(*) FROM shipments 
+                WHERE DATE(created_date) = ? AND status = 'READY'
+            """, (today,))
+            ready = self.cursor.fetchone()[0]
+            
+            return {
+                'total': total,
+                'eshop': eshop,
+                'manual': manual,
+                'ready': ready
+            }
             
         except Exception as e:
-            print(f"Error deleting shipment: {e}")
-            return False
+            print(f"Error getting stats: {e}")
+            return {'total': 0, 'eshop': 0, 'manual': 0, 'ready': 0}
     
-    # ==================== PICKUP LISTS ====================
-    
-    def create_pickup_list(self, pickup_date: date = None) -> Tuple[int, str]:
-        """
-        Create new pickup list
-        
-        Returns:
-            (list_id, pickup_list_no)
-        """
+    def create_pickup_list(self) -> Tuple[int, Dict]:
+        """Create pickup list for today's ready shipments"""
         try:
-            if not pickup_date:
-                pickup_date = date.today()
+            today = date.today()
+            today_str = today.strftime('%Y-%m-%d')
             
-            # Generate pickup list number (format: date + counter)
-            date_str = pickup_date.strftime('%Y%m%d')
+            # Get today's statistics
+            stats = self.get_today_stats()
             
-            # Check existing lists for today
+            # Generate pickup list number (format: YYYYMMDDXXXX)
             self.cursor.execute("""
                 SELECT COUNT(*) FROM pickup_lists 
                 WHERE pickup_date = ?
-            """, (pickup_date,))
-            
+            """, (today_str,))
             count = self.cursor.fetchone()[0]
-            pickup_list_no = f"{date_str}_{count + 1:02d}"
             
-            # Count shipments for today
-            shipments = self.get_all_shipments({
-                'date_from': pickup_date,
-                'date_to': pickup_date,
-                'has_voucher': True
-            })
+            pickup_list_no = f"{today.strftime('%Y%m%d')}{count+1:04d}"
             
-            eshop_count = sum(1 for s in shipments if s['source'] == 'ESHOP')
-            manual_count = sum(1 for s in shipments if s['source'] == 'MANUAL')
-            
+            # Create pickup list
             self.cursor.execute("""
                 INSERT INTO pickup_lists (
                     pickup_list_no, pickup_date, 
                     total_vouchers, eshop_count, manual_count
                 ) VALUES (?, ?, ?, ?, ?)
-            """, (pickup_list_no, pickup_date, len(shipments), eshop_count, manual_count))
+            """, (
+                pickup_list_no,
+                today_str,
+                stats['total'],
+                stats['eshop'],
+                stats['manual']
+            ))
             
-            self.conn.commit()
             list_id = self.cursor.lastrowid
             
             # Update shipments with pickup list number
-            for shipment in shipments:
-                self.update_shipment(shipment['id'], {
-                    'pickup_list_no': pickup_list_no,
-                    'pickup_date': pickup_date,
-                    'status': 'READY'
-                })
+            self.cursor.execute("""
+                UPDATE shipments 
+                SET pickup_list_no = ?, 
+                    pickup_date = ?,
+                    status = 'PICKED_UP'
+                WHERE DATE(created_date) = ? AND status = 'READY'
+            """, (pickup_list_no, today_str, today_str))
             
+            self.conn.commit()
+            
+            # Log activity
             self.log_activity(
-                'PICKUP_LIST_CREATED',
+                'CREATE_PICKUP_LIST',
                 None,
-                f"List: {pickup_list_no}, Shipments: {len(shipments)}"
+                f"Created pickup list {pickup_list_no} with {stats['total']} shipments"
             )
             
-            return list_id, pickup_list_no
+            return list_id, {
+                'pickup_list_no': pickup_list_no,
+                'total_vouchers': stats['total'],
+                'eshop_count': stats['eshop'],
+                'manual_count': stats['manual']
+            }
             
         except Exception as e:
             print(f"Error creating pickup list: {e}")
-            return None, None
+            return None, {}
     
-    def get_pickup_list(self, pickup_list_no: str) -> Dict:
-        """Get pickup list details"""
+    def get_pickup_list(self, pickup_list_no: str = None, 
+                       pickup_date: date = None) -> Optional[Dict]:
+        """Get pickup list by number or date"""
         try:
-            self.cursor.execute("""
-                SELECT * FROM pickup_lists WHERE pickup_list_no = ?
-            """, (pickup_list_no,))
+            if pickup_list_no:
+                self.cursor.execute("""
+                    SELECT * FROM pickup_lists WHERE pickup_list_no = ?
+                """, (pickup_list_no,))
+            elif pickup_date:
+                self.cursor.execute("""
+                    SELECT * FROM pickup_lists WHERE pickup_date = ?
+                """, (pickup_date.strftime('%Y-%m-%d'),))
+            else:
+                return None
             
             row = self.cursor.fetchone()
-            return dict(row) if row else None
+            if row:
+                return dict(row)
+            return None
             
         except Exception as e:
             print(f"Error getting pickup list: {e}")
             return None
     
-    def get_pickup_list_shipments(self, pickup_list_no: str) -> List[Dict]:
-        """Get all shipments in a pickup list"""
-        return self.get_all_shipments({'pickup_list_no': pickup_list_no})
-    
-    def mark_pickup_completed(self, pickup_list_no: str) -> bool:
-        """Mark pickup as completed"""
-        try:
-            self.cursor.execute("""
-                UPDATE pickup_lists 
-                SET status = 'PICKED_UP',
-                    picked_up_at = CURRENT_TIMESTAMP
-                WHERE pickup_list_no = ?
-            """, (pickup_list_no,))
-            
-            # Update all shipments in this list
-            self.cursor.execute("""
-                UPDATE shipments
-                SET status = 'PICKED_UP'
-                WHERE pickup_list_no = ?
-            """, (pickup_list_no,))
-            
-            self.conn.commit()
-            
-            self.log_activity(
-                'PICKUP_COMPLETED',
-                None,
-                f"Pickup list: {pickup_list_no}"
-            )
-            
-            return True
-            
-        except Exception as e:
-            print(f"Error marking pickup completed: {e}")
-            return False
-    
-    # ==================== STATISTICS ====================
-    
-    def get_today_stats(self) -> Dict:
-        """Get today's shipment statistics"""
-        today = date.today()
-        
-        shipments = self.get_all_shipments({
-            'date_from': today,
-            'date_to': today
-        })
-        
-        return {
-            'total': len(shipments),
-            'eshop': sum(1 for s in shipments if s['source'] == 'ESHOP'),
-            'manual': sum(1 for s in shipments if s['source'] == 'MANUAL'),
-            'with_voucher': sum(1 for s in shipments if s['voucher_no']),
-            'ready': sum(1 for s in shipments if s['status'] == 'READY'),
-            'picked_up': sum(1 for s in shipments if s['status'] == 'PICKED_UP'),
-            'total_cod': sum(s['cod_amount'] for s in shipments if s['cod_amount'])
-        }
-    
-    def get_period_stats(self, days: int = 30) -> Dict:
-        """Get statistics for last N days"""
-        date_from = date.today() - timedelta(days=days)
-        
-        shipments = self.get_all_shipments({
-            'date_from': date_from
-        })
-        
-        return {
-            'total_shipments': len(shipments),
-            'eshop_orders': sum(1 for s in shipments if s['source'] == 'ESHOP'),
-            'manual_entries': sum(1 for s in shipments if s['source'] == 'MANUAL'),
-            'total_cod_collected': sum(s['cod_amount'] for s in shipments if s['cod_amount']),
-            'average_per_day': len(shipments) / days
-        }
-    
-    # ==================== ACTIVITY LOG ====================
-    
-    def log_activity(self, action: str, voucher_no: str = None, details: str = None):
+    def log_activity(self, action: str, voucher_no: str = None, 
+                    details: str = None):
         """Log activity to database"""
         try:
             self.cursor.execute("""
                 INSERT INTO activity_log (action, voucher_no, details)
                 VALUES (?, ?, ?)
             """, (action, voucher_no, details))
-            
             self.conn.commit()
-            
         except Exception as e:
             print(f"Error logging activity: {e}")
     
-    def get_recent_activity(self, limit: int = 50) -> List[Dict]:
-        """Get recent activity log"""
+    def get_activity_log(self, limit: int = 100, 
+                        date_from: date = None) -> List[Dict]:
+        """Get activity log"""
         try:
-            self.cursor.execute("""
-                SELECT * FROM activity_log
-                ORDER BY timestamp DESC
-                LIMIT ?
-            """, (limit,))
+            query = "SELECT * FROM activity_log WHERE 1=1"
+            params = []
             
+            if date_from:
+                query += " AND DATE(timestamp) >= ?"
+                params.append(date_from.strftime('%Y-%m-%d'))
+            
+            query += " ORDER BY timestamp DESC LIMIT ?"
+            params.append(limit)
+            
+            self.cursor.execute(query, params)
             rows = self.cursor.fetchall()
+            
             return [dict(row) for row in rows]
             
         except Exception as e:
             print(f"Error getting activity log: {e}")
             return []
     
-    # ==================== CLEANUP ====================
-    
     def close(self):
         """Close database connection"""
         if self.conn:
             self.conn.close()
+    
+    def __enter__(self):
+        """Context manager entry"""
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit"""
+        self.close()
+
+
+# Test database connection
+if __name__ == "__main__":
+    print("Testing ACS Database...")
+    
+    db = ACSDatabase()
+    
+    # Test connection
+    if db.conn:
+        print("✅ Database connected")
+        print(f"✅ Tables created")
+        
+        # Get today's stats
+        stats = db.get_today_stats()
+        print(f"📊 Today's stats: {stats}")
+        
+        # Check if pdf_path column exists
+        db.cursor.execute("PRAGMA table_info(shipments)")
+        columns = [col[1] for col in db.cursor.fetchall()]
+        if 'pdf_path' in columns:
+            print("✅ pdf_path column exists - ready for auto PDF save!")
+        else:
+            print("❌ pdf_path column missing")
+    else:
+        print("❌ Database connection failed")
+    
+    db.close()
+    print("\nDatabase test complete!")

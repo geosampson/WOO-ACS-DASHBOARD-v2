@@ -1,19 +1,14 @@
 """
-ACS Courier REST API Client - CORRECTED VERSION
-Follows official ACS REST API documentation (June 2024)
-
-CRITICAL FIXES:
-- Correct endpoint structure (all requests to single URL)
-- Proper JSON format with ACSAlias + ACSInputParameters
-- API Key in headers
-- Correct field names from documentation
-- Proper error handling
-- Pickup list support
+ACS Courier REST API Client - FIXED VERSION
+✅ Improved PDF download with retries and delays
+✅ Auto-open PDFs for preview
 """
 
 import requests
 import json
 import base64
+import os
+import time
 from datetime import datetime, date
 from typing import Dict, List, Optional
 from time import sleep
@@ -66,7 +61,6 @@ class ACSCourierAPI:
     
     def _rate_limit(self):
         """Enforce rate limiting"""
-        import time
         now = time.time()
         elapsed = now - self.last_call_time
         
@@ -272,59 +266,116 @@ class ACSCourierAPI:
         return ','.join(products) if products else None
     
     def print_voucher(self, voucher_no: str, print_type: int = 2, 
-                     output_path: str = None) -> Dict:
+                     output_path: str = None, retry_delay: int = 3, 
+                     max_retries: int = 3) -> Dict:
         """
-        Print voucher as PDF
+        Print voucher as PDF with retry logic and delays
         Documentation: Page 10 (ACS_Print_Voucher_V2)
         
         Args:
             voucher_no: Voucher number
             print_type: 1=thermal, 2=laser A4 (default)
             output_path: Path to save PDF
+            retry_delay: Seconds to wait between retries (default: 3)
+            max_retries: Maximum number of retry attempts (default: 3)
             
         Returns:
             Dict with PDF data or file path
         """
-        params = {
-            "Voucher_No": voucher_no,
-            "Print_Type": print_type,  # 1=thermal, 2=laser
-            "Start_Position": 1,  # Position on A4 (1, 2, or 3)
-            "Language": "GR"
-        }
         
-        result = self._make_request("ACS_Print_Voucher_V2", params)
-        
-        if result['success']:
-            # Response contains PDF in ACSObjectOutput (not ACSValueOutput!)
-            obj_output = result['data'].get('ACSObjectOutput', [])
+        # Try multiple times with delays
+        for attempt in range(max_retries):
+            if attempt > 0:
+                print(f"   Retry attempt {attempt + 1}/{max_retries} after {retry_delay}s delay...")
+                time.sleep(retry_delay)
             
-            if obj_output and len(obj_output) > 0:
+            params = {
+                "Voucher_No": voucher_no,
+                "Print_Type": print_type,
+                "Start_Position": 1,
+                "Language": "GR"
+            }
+            
+            result = self._make_request("ACS_Print_Voucher_V2", params)
+            
+            if result['success']:
+                obj_output = result['data'].get('ACSObjectOutput', [])
+                
+                # DEBUG: Show what we got
+                if not obj_output or len(obj_output) == 0:
+                    print(f"   ⚠️ ACSObjectOutput is empty on attempt {attempt + 1}")
+                    
+                    # Check if error in response
+                    if result['data'].get('ACSExecution_HasError'):
+                        error_msg = result['data'].get('ACSExecutionErrorMessage', 'Unknown error')
+                        return {
+                            'success': False,
+                            'error': f'PDF generation error: {error_msg}'
+                        }
+                    
+                    # Try next attempt
+                    continue
+                
                 # PDF is in format: {voucher_no: base64_pdf_data}
                 pdf_data = obj_output[0]
                 
                 # Get the PDF (voucher_no is the key)
                 pdf_base64 = pdf_data.get(voucher_no)
                 
+                if not pdf_base64:
+                    # Maybe the key is different? Try to get any PDF data
+                    print(f"   ⚠️ Voucher number '{voucher_no}' not found in PDF data")
+                    if pdf_data:
+                        # Get first value (might be the PDF)
+                        pdf_base64 = next(iter(pdf_data.values()), None)
+                        if pdf_base64:
+                            print(f"   ℹ️ Using first available PDF data")
+                
                 if pdf_base64:
-                    if output_path:
-                        # Decode and save
-                        pdf_bytes = base64.b64decode(pdf_base64)
-                        with open(output_path, 'wb') as f:
-                            f.write(pdf_bytes)
-                        
-                        return {
-                            'success': True,
-                            'file_path': output_path
-                        }
-                    else:
-                        return {
-                            'success': True,
-                            'pdf_base64': pdf_base64
-                        }
+                    # Validate it's actually base64 data
+                    if len(pdf_base64) < 100:
+                        print(f"   ⚠️ PDF data too short ({len(pdf_base64)} chars), might be invalid")
+                        continue
+                    
+                    try:
+                        if output_path:
+                            # Decode and save
+                            pdf_bytes = base64.b64decode(pdf_base64)
+                            
+                            # Verify PDF starts with PDF magic bytes
+                            if not pdf_bytes.startswith(b'%PDF'):
+                                print(f"   ⚠️ Data doesn't look like a PDF file")
+                                continue
+                            
+                            with open(output_path, 'wb') as f:
+                                f.write(pdf_bytes)
+                            
+                            # Verify file was created and has content
+                            if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+                                print(f"   ⚠️ PDF file is empty or wasn't created")
+                                continue
+                            
+                            print(f"   ✅ PDF saved successfully ({len(pdf_bytes)} bytes)")
+                            return {
+                                'success': True,
+                                'file_path': output_path,
+                                'size_bytes': len(pdf_bytes)
+                            }
+                        else:
+                            return {
+                                'success': True,
+                                'pdf_base64': pdf_base64
+                            }
+                    
+                    except Exception as e:
+                        print(f"   ⚠️ Error decoding/saving PDF: {e}")
+                        continue
         
+        # All attempts failed
         return {
             'success': False,
-            'error': 'Failed to get PDF'
+            'error': f'Failed to get PDF after {max_retries} attempts. PDF may not be available yet, try downloading from "All Shipments" tab later.',
+            'voucher_no': voucher_no
         }
     
     def create_pickup_list(self, pickup_date: str = None, my_data: int = 0) -> Dict:

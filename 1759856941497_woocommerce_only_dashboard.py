@@ -1,4 +1,5 @@
 import tkinter as tk
+import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
 import requests
 from requests.auth import HTTPBasicAuth
@@ -121,6 +122,12 @@ class EnhancedWooCommerceDashboard:
         self.root.title("Roussakis E-shop Analytics Dashboard - Enhanced")
         self.root.geometry("1800x1000")
         
+        # ===== AUTO-CONNECT CONFIGURATION =====
+        # Your WooCommerce credentials (change if needed)
+        self.STORE_URL = "https://roussakis.com.gr"
+        self.CONSUMER_KEY = "ck_bb11ea8930c80ab895887236e037ddcfbee003e1"
+        self.CONSUMER_SECRET = "cs_c7cc521fbe93def7c731a920632c0c23c50d0bd7"
+        
         self.woo = None
         self.all_products = []
         self.all_orders = []
@@ -129,8 +136,11 @@ class EnhancedWooCommerceDashboard:
         self.refresh_timer = None
         self.seconds_until_refresh = self.refresh_interval
         
+        # Setup GUI first (but ACS tab will be placeholder)
         self.setup_gui()
-        self.show_config_dialog()
+        
+        # THEN auto-connect
+        self.auto_connect()
         
     def setup_gui(self):
         """Setup main interface"""
@@ -174,12 +184,99 @@ class EnhancedWooCommerceDashboard:
         self.notebook.add(self.log_frame, text="📝 Activity Log")
         self.setup_log_tab()
 
-        # Tab 7: ACS Shipping Management (NEW!)
-        self.acs_frame = ACSShippingTab(self.notebook, self.woo, self.log)
-        self.notebook.add(self.acs_frame, text="📦 ACS Shipping")
+        # Tab 7: ACS Shipping - PLACEHOLDER (will be created after connection)
+        self.acs_placeholder_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.acs_placeholder_frame, text="📦 ACS Shipping")
+        ttk.Label(self.acs_placeholder_frame, 
+                 text="⏳ Connecting to WooCommerce...\n\nACS Shipping will load once connected.",
+                 font=('Arial', 14)).pack(expand=True)
         
         # Status bar with auto-refresh countdown
         self.setup_status_bar()
+    
+    def auto_connect(self):
+        """Auto-connect to WooCommerce on startup"""
+        self.log("🔄 Auto-connecting to WooCommerce...")
+        self.status_var.set("⏳ Connecting to WooCommerce...")
+        
+        def connect_thread():
+            try:
+                # Create WooCommerce API instance
+                self.woo = WooCommerceAPI(self.STORE_URL, self.CONSUMER_KEY, self.CONSUMER_SECRET)
+                
+                # Test connection
+                if self.woo.test_connection():
+                    self.root.after(0, self.on_connection_success)
+                else:
+                    self.root.after(0, self.on_connection_failed)
+                    
+            except Exception as e:
+                self.root.after(0, lambda: self.on_connection_error(str(e)))
+        
+        # Connect in background thread
+        thread = threading.Thread(target=connect_thread, daemon=True)
+        thread.start()
+    
+    def on_connection_success(self):
+        """Called when WooCommerce connection succeeds"""
+        self.status_var.set("✅ Connected to WooCommerce")
+        self.log("✅ SUCCESS! Connected to WooCommerce API")
+        
+        # NOW create the ACS tab with working WooCommerce API
+        self.create_acs_tab()
+        
+        # Load all data
+        self.load_all_data()
+        
+        # Start auto-refresh timer
+        self.start_refresh_countdown()
+        
+        messagebox.showinfo("Connected", 
+            "✅ Connected successfully to WooCommerce!\n\n" +
+            "Loading all data...\n" +
+            "Auto-refresh: Every 15 minutes")
+    
+    def on_connection_failed(self):
+        """Called when WooCommerce connection fails"""
+        self.status_var.set("❌ Connection Failed")
+        self.log("❌ ERROR: Failed to connect to WooCommerce")
+        
+        messagebox.showerror("Connection Failed", 
+            "Could not connect to WooCommerce API.\n\n" +
+            "Please check:\n" +
+            "- Store URL is correct\n" +
+            "- API keys are correct\n" +
+            "- Internet connection\n\n" +
+            "The app will retry in background...")
+        
+        # Retry after 30 seconds
+        self.root.after(30000, self.auto_connect)
+    
+    def on_connection_error(self, error_msg):
+        """Called when connection throws an exception"""
+        self.status_var.set("❌ Connection Error")
+        self.log(f"❌ ERROR: {error_msg}")
+        
+        messagebox.showerror("Error", f"Connection error:\n\n{error_msg}")
+        
+        # Retry after 30 seconds
+        self.root.after(30000, self.auto_connect)
+    
+    def create_acs_tab(self):
+        """Create ACS tab after WooCommerce is connected"""
+        try:
+            # Remove placeholder
+            self.notebook.forget(self.acs_placeholder_frame)
+            
+            # Create real ACS tab with working WooCommerce API
+            self.acs_frame = ACSShippingTab(self.notebook, self.woo, self.log)
+            self.notebook.add(self.acs_frame, text="📦 ACS Shipping")
+            
+            self.log("✅ ACS Shipping module initialized")
+            
+        except Exception as e:
+            self.log(f"❌ Error creating ACS tab: {e}")
+            messagebox.showerror("Error", f"Failed to initialize ACS module:\n\n{e}")
         
     def setup_products_tab(self):
         """Setup products tab with search and filters"""
@@ -464,74 +561,11 @@ class EnhancedWooCommerceDashboard:
         status_frame = ttk.Frame(self.root)
         status_frame.pack(side='bottom', fill='x', padx=10, pady=5)
         
-        self.status_var = tk.StringVar(value="Not Connected")
+        self.status_var = tk.StringVar(value="Starting...")
         ttk.Label(status_frame, textvariable=self.status_var).pack(side='left')
         
         self.refresh_label = ttk.Label(status_frame, text="")
         self.refresh_label.pack(side='right')
-        
-    def show_config_dialog(self):
-        """Show WooCommerce config dialog"""
-        config_window = tk.Toplevel(self.root)
-        config_window.title("WooCommerce Connection")
-        config_window.geometry("550x350")
-        config_window.grab_set()
-        
-        frame = ttk.Frame(config_window, padding="20")
-        frame.pack(fill='both', expand=True)
-        
-        ttk.Label(frame, text="WooCommerce API Settings", 
-                 font=('Arial', 14, 'bold')).grid(row=0, column=0, columnspan=2, pady=(0,20))
-        
-        ttk.Label(frame, text="Store URL:").grid(row=1, column=0, sticky=tk.W, pady=5)
-        store_var = tk.StringVar(value="https://roussakis.com.gr")
-        ttk.Entry(frame, textvariable=store_var, width=50).grid(row=1, column=1, pady=5)
-        
-        ttk.Label(frame, text="Consumer Key:").grid(row=2, column=0, sticky=tk.W, pady=5)
-        key_var = tk.StringVar(value="ck_bb11ea8930c80ab895887236e037ddcfbee003e1")
-        ttk.Entry(frame, textvariable=key_var, width=50).grid(row=2, column=1, pady=5)
-        
-        ttk.Label(frame, text="Consumer Secret:").grid(row=3, column=0, sticky=tk.W, pady=5)
-        secret_var = tk.StringVar(value="cs_c7cc521fbe93def7c731a920632c0c23c50d0bd7")
-        ttk.Entry(frame, textvariable=secret_var, width=50, show="*").grid(row=3, column=1, pady=5)
-        
-        # Auto-refresh option
-        ttk.Label(frame, text="Auto-refresh every:").grid(row=4, column=0, sticky=tk.W, pady=5)
-        refresh_frame = ttk.Frame(frame)
-        refresh_frame.grid(row=4, column=1, sticky=tk.W)
-        ttk.Label(refresh_frame, text="15 minutes").pack(side='left')
-        
-        def connect():
-            self.woo = WooCommerceAPI(store_var.get(), key_var.get(), secret_var.get())
-            
-            self.log("Testing WooCommerce connection...")
-            
-            if self.woo.test_connection():
-                self.status_var.set("✅ Connected to WooCommerce")
-                config_window.destroy()
-                self.log("✅ SUCCESS! Connected to WooCommerce API")
-                
-                # Load all data in background
-                self.load_all_data()
-                
-                # Start auto-refresh timer
-                self.start_refresh_countdown()
-                
-                messagebox.showinfo("Success", 
-                    "✅ Connected successfully!\n\n" +
-                    "Loading all data...\n" +
-                    "Auto-refresh: Every 15 minutes")
-            else:
-                self.log("❌ ERROR: Failed to connect")
-                messagebox.showerror("Connection Failed", 
-                    "Could not connect to WooCommerce API.\n\n" +
-                    "Please check:\n" +
-                    "- Store URL is correct\n" +
-                    "- API keys are correct\n" +
-                    "- Internet connection")
-        
-        ttk.Button(frame, text="Connect", 
-                  command=connect).grid(row=5, column=0, columnspan=2, pady=20)
         
     def log(self, message: str):
         """Add to activity log"""
