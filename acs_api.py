@@ -468,29 +468,36 @@ class ACSCourierAPI:
         result = self._make_request("ACS_Print_Pickup_List", params)
         
         if result['success']:
-            obj_output = result['data'].get('ACSObjectOutput', [])
+            # FIXED: Same structure as voucher PDF
+            # ACSValueOutput[0]['ACSObjectOutput']['PDFData']
+            value_output = result['data'].get('ACSValueOutput', [])
             
-            if obj_output:
-                pdf_base64 = obj_output[0]
+            if value_output and len(value_output) > 0:
+                first_item = value_output[0]
                 
-                if output_path:
-                    pdf_bytes = base64.b64decode(pdf_base64)
-                    with open(output_path, 'wb') as f:
-                        f.write(pdf_bytes)
+                if isinstance(first_item, dict) and 'ACSObjectOutput' in first_item:
+                    acs_object = first_item['ACSObjectOutput']
+                    pdf_base64 = acs_object.get('PDFData')
                     
-                    return {
-                        'success': True,
-                        'file_path': output_path
-                    }
-                else:
-                    return {
-                        'success': True,
-                        'pdf_base64': pdf_base64
-                    }
+                    if pdf_base64:
+                        if output_path:
+                            pdf_bytes = base64.b64decode(pdf_base64)
+                            with open(output_path, 'wb') as f:
+                                f.write(pdf_bytes)
+                            
+                            return {
+                                'success': True,
+                                'file_path': output_path
+                            }
+                        else:
+                            return {
+                                'success': True,
+                                'pdf_base64': pdf_base64
+                            }
         
         return {
             'success': False,
-            'error': 'Failed to print pickup list'
+            'error': 'Failed to print pickup list - PDF data not found'
         }
     
     def track_shipment_summary(self, voucher_no: str) -> Dict:
