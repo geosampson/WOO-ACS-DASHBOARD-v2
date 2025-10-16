@@ -299,11 +299,13 @@ class ACSCourierAPI:
             result = self._make_request("ACS_Print_Voucher_V2", params)
             
             if result['success']:
-                obj_output = result['data'].get('ACSObjectOutput', [])
+                # FIXED: PDF comes in nested structure!
+                # ACSOutputResponce -> ACSValueOutput -> [0] -> 'ACSObjectOutput' -> {voucher_no: base64}
+                value_output = result['data'].get('ACSValueOutput', [])
                 
                 # DEBUG: Show what we got
-                if not obj_output or len(obj_output) == 0:
-                    print(f"   ⚠️ ACSObjectOutput is empty on attempt {attempt + 1}")
+                if not value_output or len(value_output) == 0:
+                    print(f"   ⚠️ ACSValueOutput is empty on attempt {attempt + 1}")
                     
                     # Check if error in response
                     if result['data'].get('ACSExecution_HasError'):
@@ -316,20 +318,21 @@ class ACSCourierAPI:
                     # Try next attempt
                     continue
                 
-                # PDF is in format: {voucher_no: base64_pdf_data}
-                pdf_data = obj_output[0]
+                # Get the nested ACSObjectOutput
+                # Structure: ACSValueOutput[0]['ACSObjectOutput']['PDFData']
+                first_item = value_output[0]
+                if not isinstance(first_item, dict) or 'ACSObjectOutput' not in first_item:
+                    print(f"   ⚠️ Unexpected structure in ACSValueOutput")
+                    continue
                 
-                # Get the PDF (voucher_no is the key)
-                pdf_base64 = pdf_data.get(voucher_no)
+                acs_object = first_item['ACSObjectOutput']
+                
+                # The PDF is in the 'PDFData' field
+                pdf_base64 = acs_object.get('PDFData')
                 
                 if not pdf_base64:
-                    # Maybe the key is different? Try to get any PDF data
-                    print(f"   ⚠️ Voucher number '{voucher_no}' not found in PDF data")
-                    if pdf_data:
-                        # Get first value (might be the PDF)
-                        pdf_base64 = next(iter(pdf_data.values()), None)
-                        if pdf_base64:
-                            print(f"   ℹ️ Using first available PDF data")
+                    print(f"   ⚠️ PDFData field not found in response")
+                    continue
                 
                 if pdf_base64:
                     # Validate it's actually base64 data
